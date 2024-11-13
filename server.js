@@ -1,6 +1,9 @@
 const express = require("express");
 const axios = require("axios");
 const bodyParser = require("body-parser");
+const multer = require("multer");
+
+const upload = multer({ dest: "uploads/" });
 
 axios.defaults.timeout = 5000;
 
@@ -11,8 +14,7 @@ const PORT = 3000;
 
 // LinkedIn App Config
 const linkedinConfig = {
-  clientId: "",
-  clientSecret: "",
+
   redirectUri: "http://localhost:3000/linkedin/callback",
 };
 
@@ -47,6 +49,8 @@ const getUserProfile = async (accessToken) => {
   try {
     const response = await axios.get("https://api.linkedin.com/v2/me", {
       headers: { Authorization: `Bearer ${accessToken}` },
+      timeout: 10000,
+      family: 4,
     });
     return response.data;
   } catch (error) {
@@ -63,6 +67,8 @@ const getUserPages = async (accessToken) => {
       "https://api.linkedin.com/v2/organizationAcls?q=roleAssignee&role=ADMINISTRATOR",
       {
         headers: { Authorization: `Bearer ${accessToken}` },
+        timeout: 10000,
+        family: 4,
       }
     );
     return response.data.elements;
@@ -74,16 +80,76 @@ const getUserPages = async (accessToken) => {
 };
 
 // Helper: Post on LinkedIn Page
-const postOnLinkedInPage = async (accessToken, orgId, text) => {
+const uploadFileToLinkedIn = async (accessToken, orgId, filePath, fileName) => {
+  const registerUploadUrl =
+    "https://api.linkedin.com/rest/assets?action=registerUpload";
+
+  const registerPayload = {
+    registerUploadRequest: {
+      owner: `urn:li:organization:${orgId}`,
+      recipes: ["urn:li:digitalmediaRecipe:feedshare-image"],
+      serviceRelationships: [
+        {
+          identifier: "urn:li:userGeneratedContent",
+          relationshipType: "OWNER",
+        },
+      ],
+      supportedUploadMechanism: ["SYNCHRONOUS_UPLOAD"],
+    },
+  };
+  try {
+    const registerResponse = await axios.post(
+      registerUploadUrl,
+      registerPayload,
+      {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "Content-Type": "application/json",
+        },
+      }
+    );
+
+    const uploadUrl =
+      registerResponse.data.value.uploadMechanism[
+        "com.linkedin.digitalmedia.uploading.MediaUploadHttpRequest"
+      ].uploadUrl;
+    const asset = registerResponse.data.value.asset;
+
+    console.log("uploadUrl", uploadUrl);
+
+    // Step 2: Upload the file to the upload URL
+    const fs = require("fs");
+    const fileStream = fs.createReadStream(filePath);
+
+    const uploadResponse = await axios.put(uploadUrl, fileStream, {
+      headers: {
+        "Content-Type": "application/octet-stream",
+      },
+    });
+
+    console.log("Upload Response:", uploadResponse.data);
+
+    return asset; // Return the asset ID to include in the post
+  } catch (error) {
+    console.error(
+      "Error Response from LinkedIn API:",
+      error.response?.data || error.message
+    );
+    throw new Error(
+      `Error uploading file: ${error.response?.data || error.message}`
+    );
+  }
+};
+
+const postOnLinkedInPage = async (accessToken, orgId, text, asset) => {
   const postData = {
     author: `urn:li:organization:${orgId}`,
     lifecycleState: "PUBLISHED",
     specificContent: {
       "com.linkedin.ugc.ShareContent": {
-        shareCommentary: {
-          text,
-        },
-        shareMediaCategory: "NONE",
+        shareCommentary: { text },
+        shareMediaCategory: asset ? "IMAGE" : "NONE",
+        media: asset ? [{ status: "READY", media: asset }] : [],
       },
     },
     visibility: {
@@ -92,6 +158,8 @@ const postOnLinkedInPage = async (accessToken, orgId, text) => {
   };
 
   try {
+    console.log("Request Payload:", JSON.stringify(postData, null, 2));
+
     const response = await axios.post(
       "https://api.linkedin.com/v2/ugcPosts",
       postData,
@@ -100,10 +168,15 @@ const postOnLinkedInPage = async (accessToken, orgId, text) => {
           Authorization: `Bearer ${accessToken}`,
           "Content-Type": "application/json",
         },
+        timeout: 10000,
+        family: 4,
       }
     );
+
+    console.log("Response Data:", response.data);
     return response.data;
   } catch (error) {
+    console.error("Error Response:", error.response?.data || error.message);
     throw new Error(
       `Error posting on LinkedIn: ${error.response?.data || error.message}`
     );
@@ -126,6 +199,7 @@ app.get("/linkedin/callback", async (req, res) => {
 
   try {
     const accessToken = await getAccessToken(code, linkedinConfig.redirectUri);
+    console.log(accessToken);
 
     const userProfile = await getUserProfile(accessToken);
     const pages = await getUserPages(accessToken);
@@ -134,21 +208,64 @@ app.get("/linkedin/callback", async (req, res) => {
       return res.send("No pages found for this user.");
     }
 
-    const organization = pages[0].organization.split(":").pop(); // Use the first organization
-    const postResponse = await postOnLinkedInPage(
-      accessToken,
-      organization,
-      "Hello from LinkedIn API!"
-    );
-
+    // Return the list of pages to the user for selection
     res.json({
-      message: "Post created successfully!",
+      message: "Select an organization to post to.",
       userProfile,
-      postResponse,
+      pages: pages.map((page) => ({
+        id: page.organization.split(":").pop(), // Extract the organization ID
+        name: page.organization, // Add additional information if needed
+      })),
     });
   } catch (error) {
     console.error(error.message);
     res.status(500).send(error.message);
+  }
+});
+
+// Route: Post on selected LinkedIn Page
+app.post("/linkedin/post", upload.single("file"), async (req, res) => {
+  console.log("Uploaded File:", req.file);
+
+  const { accessToken, orgId, text } = req.body;
+  const file = req.file;
+
+  if (!accessToken || !orgId || !text) {
+    return res
+      .status(400)
+      .send("Access token, organization ID, and text are required.");
+  }
+
+  try {
+    let asset = null;
+
+    if (file) {
+      console.log("Uploading file to LinkedIn:", file.path);
+      asset = await uploadFileToLinkedIn(
+        accessToken,
+        orgId,
+        file.path,
+        file.originalname
+      );
+    }
+
+    const postResponse = await postOnLinkedInPage(
+      accessToken,
+      orgId,
+      text,
+      asset
+    );
+
+    res.json({
+      message: "Post created successfully!",
+      postResponse,
+    });
+  } catch (error) {
+    console.error("Error Details:", error.response?.data || error.message);
+    res.status(500).json({
+      error: "Error posting on LinkedIn",
+      details: error.response?.data || error.message,
+    });
   }
 });
 
